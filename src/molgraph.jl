@@ -1,4 +1,4 @@
-using ISOKANN: OpenMMSimulation
+using ISOKANN: OpenMMSimulation, ISOKANN
 using GraphNeuralNetworks: GNNGraph, adjacency_matrix, EGNNConv
 using ChainRulesCore: @ignore_derivatives, ignore_derivatives
 import SparseArrays
@@ -27,7 +27,7 @@ function kmmpoolmat(x, n, adj)
     A = proj' * adj * proj
     A = A - Diagonal(A)
     A = A .> 0
-    A = collect(Int, A)
+    #A = collect(Int, A)
     w = collect(km.wcounts')
     return A, collect(proj), w
 end
@@ -38,27 +38,25 @@ function kmmpool(adj, x, f, n)
     A, proj, w = ignore_derivatives() do 
         kmmpoolmat(x,n, adj)
     end
-    @show A
+    #@show A
     
-    f = f * proj 
-    x = x * proj 
+    f = f * proj ./ w
+    x = x * proj ./ w
 
     return A, x, f, proj
 end
 
 # add dispatch for feature graph
-function (l::GraphNeuralNetworks.EGNNConv)(g::GraphNeuralNetworks.GNNGraph)
-    f, x = l(g, g.f, g.x)
-    GNNGraph(g, ndata=(;f, x))
+function (l::EGNNConv)(g::GNNGraph)
+    f,x = l(g, g.f, g.x)
+    GNNGraph(g, ndata=(;x,f))
 end
-
+using Flux.Zygote: @showgrad
 function unpool(g, (proj, gold) , residual=false)
-    A = adjacency_matrix(gold)
-
-    f = g.f * proj' + residual * gold.f
-    x = g.x * proj' + residual * gold.x
+    f = @showgrad(g.f) * proj' + residual * gold.f
+    x = @showgrad(g.x) * proj' + residual * gold.x
         
-    GNNGraph(A; ndata=(; x, f))
+    GNNGraph(gold.graph; ndata=(; x, f))
 end
 
 abstract type UNet end
@@ -70,23 +68,66 @@ struct UNet1 <: UNet
     u2
 end
 
-function UNet(nh=8)   
-    UNet1(EGNNConv(1=>nh), EGNNConv(nh=>nh), EGNNConv(nh=>nh), EGNNConv(nh=>nh))
+function UNet(nh=4, residual=false)   
+    UNet1(EGNNConv(1 => nh; ), EGNNConv(nh => nh; residual), EGNNConv(nh => nh; residual), EGNNConv(nh => nh; residual))
 end
 
 function (model::UNet)(g::GNNGraph)
-    
     g = model.d1(g)
     g, un1 = kmmpool(g, 10)
-    g = model.d2(g)
-    #g = unpool(g, un1, false)
-    
-    
-    g = model.u2(g)
+    g = @showgrad(model.d2(g))
+    g = @showgrad(unpool(g, un1, false))
+    g = @showgrad(model.u2(g))
     
     g = model.u1(g)
     return g
 end
+
+function eval2(model, g)
+
+
+    f, x = model.d1(g, g.f, g.x)
+
+    n = 10
+
+    adj = adjacency_matrix(g)
+
+    A, proj, w = ignore_derivatives() do
+        kmmpoolmat(x, n, adj)
+    end
+
+    # pool
+    f = f * proj ./ w
+    x = x * proj ./ w
+
+    f, x = model.d2(GNNGraph(A), f, x)
+
+    f = @showgrad(f) * proj'
+    x = @showgrad(x) * proj'
+
+    sum(f) + sum(x)
+end
+
+
+function train(; g=graph(OpenMMSimulation()), u=UNet(100), n=10, opt=Flux.setup(Adam(1.0f-4), u))
+    loss(u) = sum(abs2, u(g).x-g.x[:,1:10])
+    @show loss(u)
+    for i in 1:n
+        grad = gradient(loss, u)
+        Flux.update!(opt, u, grad[1])
+        @show loss(u)
+    end
+    return (;u,g,n,opt)
+end
+
+function test_gradients()
+    g = graph(OpenMMSimulation())
+    u = UNet(3, true)
+    grad = gradient(u) do u
+        sum(abs2, u(g).x - g.x)
+    end
+end
+
 
 import Flux
 Flux.@layer UNet
