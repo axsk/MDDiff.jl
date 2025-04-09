@@ -1,4 +1,9 @@
 
+using Zygote: @ignore_derivatives
+using GraphNeuralNetworks
+using CUDA
+using Clustering
+
 function kmmpool(g, k)
     A, proj, w, x = @ignore_derivatives _kmmpool(g, k)
     f = g.f * proj ./ w
@@ -17,7 +22,7 @@ function kmmpool(g, k)
 end
 
 function _kmmpool(g, k)
-    adj = adjacency_matrix(g)
+    adj = myadjacency(g)
     km = mykmeans(g.x, k)
 
     proj = projection(km.assignments)
@@ -34,7 +39,7 @@ end
 
 mykmeans(x, k) = Clustering.kmeans(x, k)
 function mykmeans(x::CuArray, k::Integer)
-    km = Clustering.kmeans(cpu(g.x), k)
+    km = Clustering.kmeans(cpu(x), k)
     centers = gpu(km.centers)
     assignments = gpu(km.assignments)
     wcounts = gpu(km.wcounts)

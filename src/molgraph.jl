@@ -6,7 +6,7 @@ using LinearAlgebra: Diagonal
 using Flux: gradient
 using Flux.Zygote: @showgrad
 using Flux: Flux, gpu, cpu
-using Zygote: withgradient
+using Zygote: withgradient, @ignore_derivatives
 import Clustering
 using MLUtils: eachobs
 using SparseArrays: sparse
@@ -44,7 +44,7 @@ function graph(sim::OpenMMSimulation = sim)
         isapprox.(m, a, atol=0.1)'
     end
     g.ndata.f = vcat(Float32.(f), zeros(size(f, 2))')
-    g.ndata.x = collect(Float32, reshape(ISOKANN.OpenMM.getcoords(sim), 3, :))
+    g.ndata.x = collect(Float32, reshape(ISOKANN.OpenMM.coords(sim), 3, :))
     g.gdata.t = 0.
     return g
 end
@@ -94,13 +94,13 @@ function UNet(g::GNNGraph; kwargs...)
     return u
 end
 
-function UNet(;f, h=f, k1, k2, residual = true)
-    d1 = EGNNConv(f  => h; residual)
-    d2 = EGNNConv(h => h; residual)
-    d3 = EGNNConv(h => h; residual)
-    u1 = EGNNConv(h => h; residual)
-    u2 = EGNNConv(h => h; residual)
-    u3 = EGNNConv(h => h; residual)
+function UNet(;f, h=f, k1, k2, residual = true, hidden_size = 2*h)
+    d1 = EGNNConv(f => h, hidden_size; residual)
+    d2 = EGNNConv(h => h, hidden_size; residual)
+    d3 = EGNNConv(h => h, hidden_size; residual)
+    u1 = EGNNConv(h => h, hidden_size; residual)
+    u2 = EGNNConv(h => h, hidden_size; residual)
+    u3 = EGNNConv(h => h, hidden_size; residual)
     UNet3(d1,d2,d3,u1,u2,u3,k1,k2)
 end
 
@@ -109,8 +109,12 @@ function (u::UNet)(g::GNNGraph)
     g = u.d1(g)
     g, un1 = kmmpool(g, u.k1)
     g = u.d2(g)
-    g = un1(g)
+    g, un2 = kmmpool(g, u.k2)
+    g = u.d3(g)
+    g = un2(g)
     g = u.u2(g)
+    g = un1(g)
+    g = u.u1(g)
     
     #g3 = u.u1(g2)
     return g
@@ -149,7 +153,9 @@ function train(;
                 loss = 0.
                 for g in gs
                     if perturbation > 0
-                        g1 = perturb(g, rand()*(1-perturbation))
+                        t0 = rand() * (1 - perturbation)
+                        t0=1
+                        g1 = perturb(g, t0)
                         g2 = perturb(g1, perturbation)
                     else
                         g1 = g2 = g
@@ -178,12 +184,12 @@ function test_gradients(;g = graph(), u = UNet(g))
         sum(abs2, u(g).x - g.x)
     end
 end
-
+using Random: randn!
 function perturb(g, t) # t=0 equals identity
     sigma = 0.5
     gg = deepcopy(g)  # copy lead to changing xs
     x = g.ndata.x
-    gg.ndata.x = sqrt(1-t) * x + sigma * randn(size(x)) * sqrt(t)
+    gg.ndata.x = sqrt(1-t) * x + sigma * randn!(copy(x)) * sqrt(t)
     @ignore_derivatives gg.ndata.f[end, :] .+= t
     return gg
 end
@@ -195,6 +201,78 @@ function generate(u, g, steps, t=1)
         g = u(g)
     end
     return g
+end
+
+function train_ddpm(;gs, u=UNet(gs[1]), 
+        opt=Flux.setup(Flux.Adam(1.0f-3), u), 
+        epochs=1,
+        batchsize=1000, 
+        losses=Float64[],
+    )
+   
+    gg = deepcopy(gs[1])
+    for e in 1:epochs
+        for gs in eachobs(gs; batchsize)
+            l, grad = withgradient(u) do u
+                l = 0
+                for g in gs
+                    eta = @ignore_derivatives ddpm_target!(gg, g)
+                   
+                    l+=sum(abs2, u(gg).x - eta)
+                end
+                return l / length(gs)
+            end
+            @show l
+            push!(losses, l)
+            Flux.update!(opt, u, grad[1])
+        end
+    end
+    return (; losses, u, opt)
+end
+
+
+function ddpm_target!(gg, g; steps=1000)
+    beta(t) = 1e-4 + (0.02 - 1e-4) * (t-1)/(steps-1) # linear schedule
+    a(t) = 1-beta(t)
+    abar(t) =prod(a, 1:t)
+
+    eta = similar(gg.x)
+
+    t = rand(1:steps)
+    at = abar(t)
+    randn!(eta)
+    gg.f .= g.f
+    gg.f[end,:] .= t/1000
+    gg.ndata[:x] = sqrt(at) * g.x + sqrt(1 - at) * eta
+    return eta
+end
+
+function sample_ddpm(u, g, steps=1000)
+    beta(t) = 1e-4 + (0.02 - 1e-4) * (t-1)/(steps-1) # linear schedule
+    at(t) = 1-beta(t)
+    abar(t) = t>0 ? prod(at, 1:t) : 1
+
+    g = deepcopy(g)
+    g.x .= randn(size(g.x))
+    for t in steps:-1:1
+        a = at(t)
+        ab = abar(t)
+        s2 = (1-abar(t-1))/(1-ab) * beta(t)
+        #att = prod(x -> 1 - beta(x), 1:t-1)
+        x = g.x
+        g.f[end,:] .= t/steps
+        x = 1/sqrt(a) * (x - (1-a)/sqrt(1-ab) * u(g).x) + sqrt(s2) * randn(size(x))
+        g.x .= x
+    end
+    return g.x
+end
+
+function go()
+    for i in 1:100
+    @time train_ddpm(;gs, u, opt, losses, epochs=1)
+    x = sample_ddpm(u, gs[1]); ISOKANN.savecoords("test$i.pdb", OpenMMSimulation(), x|>vec)
+    plot(losses, yaxis=:log, title=i) |> display
+    end
 end
 
 
@@ -271,7 +349,7 @@ function distgraph(sim::OpenMMSimulation)
     n = length(masses)
     inds = samplerandompairs(min(n * (n + 1) / 2, 100), n)
 
-    coords = ISOKANN.OpenMM.getcoords(sim)
+    coords = ISOKANN.OpenMM.coords(sim)
 
     dists = ISOKANN.pdists(coords, inds)
     g = GNNGraph(first.(inds), last.(inds))
